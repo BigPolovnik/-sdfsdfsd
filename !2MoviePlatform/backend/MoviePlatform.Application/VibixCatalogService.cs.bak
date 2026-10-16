@@ -1,0 +1,810 @@
+using System.Globalization;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+
+namespace MoviePlatform.Application;
+
+public sealed class VibixCatalogService
+{
+    private readonly HttpClient _http;
+    private readonly VibixOptions _options;
+    private readonly ILogger<VibixCatalogService> _logger;
+
+    private const int MinPageSize = 20;
+    private const int MaxPageSize = 100;
+
+    private static readonly TimeSpan PageDelay =
+        TimeSpan.FromMilliseconds(2000);
+
+    private static readonly TimeSpan DetailsDelay =
+        TimeSpan.FromMilliseconds(1500);
+
+    private const int MaxRetriesOn429 = 3;
+
+    private static readonly TimeSpan MaxRetryAfter =
+        TimeSpan.FromSeconds(60);
+
+    public VibixCatalogService(
+        HttpClient http,
+        IOptions<VibixOptions> options,
+        ILogger<VibixCatalogService> logger)
+    {
+        _http = http;
+        _options = options.Value;
+        _logger = logger;
+
+        var baseUrl = string.IsNullOrWhiteSpace(_options.BaseUrl)
+            ? "https://vibix.org"
+            : _options.BaseUrl.TrimEnd('/');
+
+        _http.BaseAddress = new Uri(baseUrl);
+        _http.Timeout = TimeSpan.FromMinutes(60);
+
+        if (!string.IsNullOrWhiteSpace(_options.ApiToken))
+        {
+            _http.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue(
+                    "Bearer",
+                    _options.ApiToken.Trim());
+        }
+
+        _http.DefaultRequestHeaders.Accept.Clear();
+        _http.DefaultRequestHeaders.Accept.Add(
+            new MediaTypeWithQualityHeaderValue("application/json"));
+    }
+
+    public sealed record CatalogBatch(
+        List<VibixVideoDto> Items,
+        bool RateLimited,
+        DateTime? LastUploadedAt);
+
+    /// <summary>
+    /// Загружает одну страницу каталога Vibix.
+    /// </summary>
+    public async Task<CatalogBatch> GetVideosPageAsync(
+        int page,
+        CancellationToken ct = default)
+    {
+        if (page < 1)
+            page = 1;
+
+        var pageSize = GetPageSize();
+        var url =
+            $"/api/v1/publisher/videos/links?page={page}&limit={pageSize}";
+
+        try
+        {
+            var payload = await FetchPageWithRetryAsync(url, page, ct);
+            var items = payload?.Data ?? new List<VibixVideoDto>();
+
+            _logger.LogInformation(
+                "Vibix: страница {Page} — получено {Count} записей",
+                page,
+                items.Count);
+
+            return new CatalogBatch(
+                items,
+                false,
+                GetLastUploadedAt(items));
+        }
+        catch (RateLimitedException ex)
+        {
+            _logger.LogWarning(
+                "Vibix: ограничение частоты на странице {Page}: {Reason}",
+                page,
+                ex.Message);
+
+            return new CatalogBatch(
+                new List<VibixVideoDto>(),
+                true,
+                null);
+        }
+    }
+
+    /// <summary>
+    /// Загружает каталог постранично.
+    /// Если updatedFrom задан, передаёт updated_from в API.
+    /// </summary>
+    public async Task<CatalogBatch> GetVideosBatchAsync(
+        DateTime? updatedFrom = null,
+        CancellationToken ct = default)
+    {
+        var result = new List<VibixVideoDto>();
+        var pageSize = GetPageSize();
+        var page = 1;
+        var rateLimited = false;
+        DateTime? maxUploadedAt = null;
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var url =
+                $"/api/v1/publisher/videos/links?page={page}&limit={pageSize}";
+
+            if (updatedFrom.HasValue)
+            {
+                var iso = updatedFrom.Value.ToString(
+                    "yyyy-MM-ddTHH:mm:ss",
+                    CultureInfo.InvariantCulture);
+
+                url += $"&updated_from={Uri.EscapeDataString(iso)}";
+            }
+
+            VibixPaginatedResponse<VibixVideoDto>? payload;
+
+            try
+            {
+                payload = await FetchPageWithRetryAsync(url, page, ct);
+            }
+            catch (RateLimitedException ex)
+            {
+                _logger.LogWarning(
+                    "Vibix: ограничение частоты на странице {Page}. " +
+                    "Останавливаюсь, уже получено {Count} записей.",
+                    page,
+                    result.Count);
+
+                _logger.LogWarning("Причина: {Reason}", ex.Message);
+                rateLimited = true;
+                break;
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning(
+                    "Vibix: загрузка прервана на странице {Page}",
+                    page);
+                throw;
+            }
+            catch (HttpRequestException ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Vibix: ошибка загрузки страницы {Page}. " +
+                    "Уже получено {Count} записей.",
+                    page,
+                    result.Count);
+                throw;
+            }
+
+            var items = payload?.Data;
+
+            if (items is null || items.Count == 0)
+                break;
+
+            result.AddRange(items);
+
+            var pageLastUploadedAt = GetLastUploadedAt(items);
+
+            if (pageLastUploadedAt.HasValue &&
+                (!maxUploadedAt.HasValue ||
+                 pageLastUploadedAt.Value > maxUploadedAt.Value))
+            {
+                maxUploadedAt = pageLastUploadedAt.Value;
+            }
+
+            _logger.LogInformation(
+                "Vibix: страница {Page} — получено {Count} записей " +
+                "(всего {Total})",
+                page,
+                items.Count,
+                result.Count);
+
+            if (items.Count < pageSize)
+                break;
+
+            page++;
+
+            if (page > 5000)
+            {
+                _logger.LogWarning(
+                    "Vibix: достигнут защитный предел в 5000 страниц.");
+                break;
+            }
+
+            await Task.Delay(PageDelay, ct);
+        }
+
+        return new CatalogBatch(result, rateLimited, maxUploadedAt);
+    }
+
+    /// <summary>
+    /// Получает ID плеера по ID Кинопоиска.
+    /// Использует iframe_video_id, а при его отсутствии —
+    /// data-id из embed_code.
+    /// </summary>
+    public async Task<int?> GetIframeVideoIdByKpAsync(
+        int kpId,
+        CancellationToken ct = default)
+    {
+        var url = $"/api/v1/publisher/videos/kp/{kpId}";
+
+        try
+        {
+            using var response = await _http.GetAsync(url, ct);
+
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                var retryAfter =
+                    response.Headers.RetryAfter?.Delta
+                    ?? TimeSpan.FromSeconds(60);
+
+                _logger.LogWarning(
+                    "Vibix: HTTP 429 для kp={KpId}, Retry-After={Delay:F0} сек",
+                    kpId,
+                    retryAfter.TotalSeconds);
+
+                if (retryAfter > MaxRetryAfter)
+                {
+                    throw new RateLimitedException(
+                        $"Retry-After={retryAfter.TotalSeconds:F0} сек",
+                        retryAfter);
+                }
+
+                await Task.Delay(retryAfter, ct);
+                return null;
+            }
+
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                _logger.LogDebug(
+                    "Vibix: видео с kp={KpId} не найдено (404)",
+                    kpId);
+                return null;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var body = await response.Content.ReadAsStringAsync(ct);
+
+                _logger.LogWarning(
+                    "Vibix: kp={KpId} вернул HTTP {Status}. Ответ: {Body}",
+                    kpId,
+                    (int)response.StatusCode,
+                    body.Length > 300 ? body[..300] : body);
+
+                return null;
+            }
+
+            await using var stream =
+                await response.Content.ReadAsStreamAsync(ct);
+
+            using var doc = await JsonDocument.ParseAsync(
+                stream,
+                cancellationToken: ct);
+
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                return null;
+
+            var root = doc.RootElement;
+
+            if (TryReadInt(root, "iframe_video_id", out var iframeId) &&
+                iframeId > 0)
+            {
+                return iframeId;
+            }
+
+            if (root.TryGetProperty("data", out var data) &&
+                data.ValueKind == JsonValueKind.Object)
+            {
+                if (TryReadInt(data, "iframe_video_id", out iframeId) &&
+                    iframeId > 0)
+                {
+                    return iframeId;
+                }
+
+                var nestedEmbedId = TryReadEmbedVideoId(data);
+
+                if (nestedEmbedId.HasValue)
+                    return nestedEmbedId;
+            }
+
+            var embedId = TryReadEmbedVideoId(root);
+
+            if (embedId.HasValue)
+                return embedId;
+
+            _logger.LogDebug(
+                "Vibix: в ответе kp={KpId} нет iframe_video_id или data-id",
+                kpId);
+
+            return null;
+        }
+        catch (RateLimitedException)
+        {
+            throw;
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Vibix: ошибка запроса kp={KpId}",
+                kpId);
+
+            return null;
+        }
+        finally
+        {
+            await Task.Delay(DetailsDelay, ct);
+        }
+    }
+
+    private int GetPageSize()
+    {
+        var requested = _options.PageSize > 0
+            ? _options.PageSize
+            : 50;
+
+        return Math.Clamp(requested, MinPageSize, MaxPageSize);
+    }
+
+    private static DateTime? GetLastUploadedAt(
+        IEnumerable<VibixVideoDto> items)
+    {
+        DateTime? latest = null;
+
+        foreach (var item in items)
+        {
+            if (!item.UploadedAt.HasValue)
+                continue;
+
+            if (!latest.HasValue ||
+                item.UploadedAt.Value > latest.Value)
+            {
+                latest = item.UploadedAt.Value;
+            }
+        }
+
+        return latest;
+    }
+
+    private static bool TryReadInt(
+        JsonElement element,
+        string propertyName,
+        out int value)
+    {
+        value = default;
+
+        if (!element.TryGetProperty(propertyName, out var property))
+            return false;
+
+        if (property.ValueKind == JsonValueKind.Number)
+            return property.TryGetInt32(out value);
+
+        if (property.ValueKind == JsonValueKind.String)
+        {
+            return int.TryParse(
+                property.GetString(),
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out value);
+        }
+
+        return false;
+    }
+
+    private static int? TryReadEmbedVideoId(JsonElement element)
+    {
+        if (!element.TryGetProperty("embed_code", out var property) ||
+            property.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+
+        return VibixVideoDto.ParseEmbedVideoId(property.GetString());
+    }
+
+    private async Task<VibixPaginatedResponse<VibixVideoDto>?>
+        FetchPageWithRetryAsync(
+            string url,
+            int page,
+            CancellationToken ct)
+    {
+        for (var attempt = 1; attempt <= MaxRetriesOn429; attempt++)
+        {
+            using var response = await _http.GetAsync(url, ct);
+
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                var retryAfter =
+                    response.Headers.RetryAfter?.Delta
+                    ?? TimeSpan.FromSeconds(Math.Pow(2, attempt));
+
+                if (retryAfter > MaxRetryAfter)
+                {
+                    throw new RateLimitedException(
+                        $"Retry-After={retryAfter.TotalSeconds:F0} сек",
+                        retryAfter);
+                }
+
+                if (attempt == MaxRetriesOn429)
+                {
+                    throw new RateLimitedException(
+                        $"Vibix вернул HTTP 429 на странице {page} " +
+                        $"после {MaxRetriesOn429} попыток.",
+                        retryAfter);
+                }
+
+                _logger.LogWarning(
+                    "Vibix: HTTP 429 на странице {Page}, попытка {Attempt}/{Max}. " +
+                    "Повтор через {Delay:F0} сек.",
+                    page,
+                    attempt,
+                    MaxRetriesOn429,
+                    retryAfter.TotalSeconds);
+
+                await Task.Delay(retryAfter, ct);
+                continue;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var body = await response.Content.ReadAsStringAsync(ct);
+
+                _logger.LogError(
+                    "Vibix: HTTP {Status} на странице {Page}. Ответ: {Body}",
+                    (int)response.StatusCode,
+                    page,
+                    body.Length > 1000 ? body[..1000] : body);
+
+                throw new HttpRequestException(
+                    $"Vibix API вернул HTTP {(int)response.StatusCode} " +
+                    $"на странице {page}.",
+                    null,
+                    response.StatusCode);
+            }
+
+            var contentType =
+                response.Content.Headers.ContentType?.MediaType;
+
+            if (contentType is null ||
+                !contentType.Contains(
+                    "json",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                var body = await response.Content.ReadAsStringAsync(ct);
+
+                _logger.LogError(
+                    "Vibix вернул не JSON на странице {Page}. " +
+                    "Content-Type: {ContentType}. Ответ: {Body}",
+                    page,
+                    contentType,
+                    body.Length > 400 ? body[..400] : body);
+
+                throw new InvalidOperationException(
+                    $"Vibix вернул Content-Type '{contentType}' вместо JSON.");
+            }
+
+            try
+            {
+                var payload = await response.Content
+                    .ReadFromJsonAsync<VibixPaginatedResponse<VibixVideoDto>>(
+                        cancellationToken: ct);
+
+                if (payload is null)
+                {
+                    _logger.LogWarning(
+                        "Vibix: пустой JSON-ответ на странице {Page}",
+                        page);
+                }
+
+                return payload;
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Vibix: ошибка разбора JSON на странице {Page}",
+                    page);
+                throw;
+            }
+        }
+
+        throw new RateLimitedException(
+            $"Не удалось получить страницу {page} после " +
+            $"{MaxRetriesOn429} попыток.",
+            TimeSpan.Zero);
+    }
+}
+
+public sealed class RateLimitedException : Exception
+{
+    public TimeSpan RetryAfter { get; }
+
+    public RateLimitedException(
+        string message,
+        TimeSpan retryAfter) : base(message)
+    {
+        RetryAfter = retryAfter;
+    }
+}
+
+public sealed class VibixPaginatedResponse<T>
+{
+    [JsonPropertyName("data")]
+    public List<T>? Data { get; set; }
+
+    [JsonPropertyName("success")]
+    public bool Success { get; set; }
+
+    [JsonPropertyName("message")]
+    public string? Message { get; set; }
+}
+
+public sealed class VibixVideoDto
+{
+    [JsonPropertyName("id")]
+    public int Id { get; set; }
+
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+
+    [JsonPropertyName("name_rus")]
+    public string? NameRus { get; set; }
+
+    [JsonPropertyName("name_eng")]
+    public string? NameEng { get; set; }
+
+    [JsonPropertyName("name_original")]
+    public string? NameOriginal { get; set; }
+
+    [JsonPropertyName("type")]
+    public string? Type { get; set; }
+
+    [JsonPropertyName("year")]
+    public JsonElement? YearRaw { get; set; }
+
+    [JsonPropertyName("uploaded_at")]
+    public string? UploadedAtRaw { get; set; }
+
+    [JsonIgnore]
+    public int? Year =>
+        int.TryParse(ScalarToString(YearRaw), out var year)
+            ? year
+            : null;
+
+    [JsonIgnore]
+    public DateTime? UploadedAt => ParseVibixDate(UploadedAtRaw);
+
+    [JsonPropertyName("kp_id")]
+    public int? KpId { get; set; }
+
+    [JsonPropertyName("kinopoisk_id")]
+    public int? KinopoiskIdLegacy { get; set; }
+
+    [JsonPropertyName("imdb_id")]
+    public string? ImdbId { get; set; }
+
+    [JsonPropertyName("kp_rating")]
+    public JsonElement? KpRatingRaw { get; set; }
+
+    [JsonPropertyName("imdb_rating")]
+    public JsonElement? ImdbRatingRaw { get; set; }
+
+    [JsonPropertyName("kp_votes")]
+    public int? KpVotes { get; set; }
+
+    [JsonPropertyName("imdb_votes")]
+    public int? ImdbVotes { get; set; }
+
+    [JsonIgnore]
+    public decimal? KpRating =>
+        ParseDecimal(ScalarToString(KpRatingRaw));
+
+    [JsonIgnore]
+    public decimal? ImdbRating =>
+        ParseDecimal(ScalarToString(ImdbRatingRaw));
+
+    [JsonPropertyName("poster_url")]
+    public string? PosterUrl { get; set; }
+
+    [JsonPropertyName("backdrop_url")]
+    public string? BackdropUrl { get; set; }
+
+    [JsonPropertyName("iframe_url")]
+    public string? IframeUrl { get; set; }
+
+    [JsonPropertyName("embed_code")]
+    public string? EmbedCode { get; set; }
+
+    [JsonIgnore]
+    public int? EmbedVideoId => ParseEmbedVideoId(EmbedCode);
+
+    /// <summary>
+    /// Извлекает ID плеера из embed_code.
+    /// Примеры:
+    /// data-id="345721" -> 345721
+    /// data-id='345721' -> 345721
+    /// </summary>
+    public static int? ParseEmbedVideoId(string? embedCode)
+    {
+        if (string.IsNullOrWhiteSpace(embedCode))
+            return null;
+
+        // Корректно извлекает число из data-id="345721"
+        // и data-id='345721'.
+        var match = Regex.Match(
+            embedCode,
+            """data-id\s*=\s*["'](?<id>\d+)["']""",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        if (!match.Success)
+            return null;
+
+        return int.TryParse(
+            match.Groups["id"].Value,
+            NumberStyles.None,
+            CultureInfo.InvariantCulture,
+            out var id) && id > 0
+                ? id
+                : null;
+    }
+
+    [JsonPropertyName("quality")]
+    public string? Quality { get; set; }
+
+    [JsonPropertyName("duration")]
+    public int? Duration { get; set; }
+
+    [JsonPropertyName("genre")]
+    public JsonElement? GenreRaw { get; set; }
+
+    [JsonPropertyName("country")]
+    public JsonElement? CountryRaw { get; set; }
+
+    [JsonIgnore]
+    public List<string> GenreList => ParseStringOrArray(GenreRaw);
+
+    [JsonIgnore]
+    public List<string> CountryList => ParseStringOrArray(CountryRaw);
+
+    [JsonPropertyName("description")]
+    public string? Description { get; set; }
+
+    [JsonPropertyName("description_short")]
+    public string? DescriptionShort { get; set; }
+
+    [JsonPropertyName("voiceovers")]
+    public List<VibixVoiceoverDto>? Voiceovers { get; set; }
+
+    [JsonPropertyName("iframe_video_id")]
+    public int? IframeVideoId { get; set; }
+
+    /// <summary>
+    /// Пример:
+    /// { "s1": { "e1": { "v1": 8636, "v12": 206687 } } }
+    /// </summary>
+    [JsonPropertyName("episodes")]
+    public Dictionary<string, Dictionary<string, Dictionary<string, int>>>?
+        Episodes { get; set; }
+
+    private static List<string> ParseStringOrArray(JsonElement? element)
+    {
+        if (element is null)
+            return new List<string>();
+
+        var value = element.Value;
+
+        if (value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            return new List<string>();
+
+        if (value.ValueKind == JsonValueKind.String)
+        {
+            var text = value.GetString();
+
+            return string.IsNullOrWhiteSpace(text)
+                ? new List<string>()
+                : text.Split(
+                    ',',
+                    StringSplitOptions.RemoveEmptyEntries |
+                    StringSplitOptions.TrimEntries).ToList();
+        }
+
+        if (value.ValueKind == JsonValueKind.Array)
+        {
+            var list = new List<string>();
+
+            foreach (var item in value.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.String)
+                    continue;
+
+                var text = item.GetString();
+
+                if (!string.IsNullOrWhiteSpace(text))
+                    list.Add(text.Trim());
+            }
+
+            return list;
+        }
+
+        return new List<string>();
+    }
+
+    private static string? ScalarToString(JsonElement? value)
+    {
+        if (value is null)
+            return null;
+
+        var element = value.Value;
+
+        return element.ValueKind switch
+        {
+            JsonValueKind.String => element.GetString(),
+            JsonValueKind.Number => element.GetRawText(),
+            JsonValueKind.True => "true",
+            JsonValueKind.False => "false",
+            _ => null
+        };
+    }
+
+    private static decimal? ParseDecimal(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        return decimal.TryParse(
+            raw,
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out var value)
+                ? value
+                : null;
+    }
+
+    private static DateTime? ParseVibixDate(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        string[] formats =
+        {
+            "yyyy-MM-ddTHH:mm:ss",
+            "yyyy-MM-ddTHH:mm:ss.fff",
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd HH:mm:ss.fff",
+            "yyyy-MM-dd",
+            "dd.MM.yyyy HH:mm:ss",
+            "dd.MM.yyyy HH:mm",
+            "dd.MM.yyyy"
+        };
+
+        if (DateTime.TryParseExact(
+            raw,
+            formats,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal |
+            DateTimeStyles.AdjustToUniversal,
+            out var date))
+        {
+            return date;
+        }
+
+        if (DateTime.TryParse(
+            raw,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal |
+            DateTimeStyles.AdjustToUniversal,
+            out date))
+        {
+            return date;
+        }
+
+        return null;
+    }
+}
+
+public sealed class VibixVoiceoverDto
+{
+    [JsonPropertyName("id")]
+    public int Id { get; set; }
+
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+}

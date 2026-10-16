@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: movieplatform
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: "http://+:8080"
+      # ВАЖНО: строка подключения читается из этой переменной
+      ConnectionStrings__Default: "Host=postgres;Port=5432;Database=movieplatform;Username=postgres;Password=${DB_PASSWORD:-postgres}"
+      # Vibix
+      VIBIX_API_TOKEN: ${VIBIX_API_TOKEN}
+      VIBIX_BASE_URL: ${VIBIX_BASE_URL:-https://vibix.org}
+      VIBIX_AUTOSYNC: ${VIBIX_AUTOSYNC:-false}
+      VIBIX_SYNC_INTERVAL_MINUTES: ${VIBIX_SYNC_INTERVAL_MINUTES:-360}
+      VIBIX_PAGE_SIZE: ${VIBIX_PAGE_SIZE:-50}
+      ADMIN_KEY: ${ADMIN_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5000:8080"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      - api
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
